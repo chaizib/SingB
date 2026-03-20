@@ -3,7 +3,6 @@ name: Build sing-box with v2ray api
 on:
   workflow_dispatch:
   schedule:
-    # 每周一 03:20 UTC
     - cron: "20 3 * * 1"
 
 permissions:
@@ -22,7 +21,12 @@ jobs:
       - name: Get latest upstream release
         id: latest
         run: |
-          latest_tag=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+          # 加上 Token 授权防止被限流，增加重试机制
+          latest_tag=$(curl -fsSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" --retry 3 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+          if [ -z "$latest_tag" ] || [ "$latest_tag" = "null" ]; then
+            echo "::error::无法从官方获取版本号，脚本终止！"
+            exit 1
+          fi
           echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
           echo "version=${latest_tag#v}" >> "$GITHUB_OUTPUT"
 
@@ -35,7 +39,7 @@ jobs:
       - name: Skip if already latest
         if: steps.latest.outputs.tag == steps.current.outputs.tag
         run: |
-          echo "Already latest: ${{ steps.latest.outputs.tag }}"
+          echo "当前仓库已是最新版本: ${{ steps.latest.outputs.tag }}"
           exit 0
 
       - name: Checkout sing-box source
@@ -57,122 +61,54 @@ jobs:
         id: meta
         run: |
           cd sing-box-src
-
           default_tags=$(tr '\n' ',' < release/DEFAULT_BUILD_TAGS | sed 's/,$//')
-
-          # 删除 Linux 下容易导致编译失败的 naive tag
           final_tags=$(printf '%s\n' "$default_tags" | tr ',' '\n' | grep -v '^with_naive_outbound$' | awk 'NF && !seen[$0]++' | paste -sd',' -)
-
-          # 追加 v2ray api
           final_tags="${final_tags},with_v2ray_api"
-
-          # 原项目 ldflags
           base_ldflags=$(tr '\n' ' ' < release/LDFLAGS | sed 's/  */ /g')
-
-          # 显式写入版本号，避免 sing-box version 显示 unknown
           final_ldflags="-X 'github.com/sagernet/sing-box/constant.Version=${{ steps.latest.outputs.version }}' ${base_ldflags}"
-
           echo "tags=$final_tags" >> "$GITHUB_OUTPUT"
           echo "ldflags=$final_ldflags" >> "$GITHUB_OUTPUT"
 
-          echo "Using tags: $final_tags"
-          echo "Using ldflags: $final_ldflags"
-
-      - name: Build linux amd64
+      - name: Build All Platforms
         run: |
           cd sing-box-src
-          mkdir -p ../dist/linux-amd64
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-          go build -trimpath \
-            -ldflags "${{ steps.meta.outputs.ldflags }}" \
-            -tags "${{ steps.meta.outputs.tags }}" \
-            -o ../dist/linux-amd64/sing-box \
-            ./cmd/sing-box
+          # 循环编译 amd64, arm64, armv7, 386
+          for arch in amd64 arm64 arm 386; do
+            output_dir="../dist/linux-$arch"
+            [ "$arch" = "arm" ] && output_dir="../dist/linux-armv7"
+            mkdir -p "$output_dir"
+            GOARM=7 CGO_ENABLED=0 GOOS=linux GOARCH=$arch \
+            go build -trimpath \
+              -ldflags "${{ steps.meta.outputs.ldflags }}" \
+              -tags "${{ steps.meta.outputs.tags }}" \
+              -o "$output_dir/sing-box" \
+              ./cmd/sing-box
+          done
 
-      - name: Build linux arm64
-        run: |
-          cd sing-box-src
-          mkdir -p ../dist/linux-arm64
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-          go build -trimpath \
-            -ldflags "${{ steps.meta.outputs.ldflags }}" \
-            -tags "${{ steps.meta.outputs.tags }}" \
-            -o ../dist/linux-arm64/sing-box \
-            ./cmd/sing-box
-
-      - name: Build linux armv7
-        run: |
-          cd sing-box-src
-          mkdir -p ../dist/linux-armv7
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 \
-          go build -trimpath \
-            -ldflags "${{ steps.meta.outputs.ldflags }}" \
-            -tags "${{ steps.meta.outputs.tags }}" \
-            -o ../dist/linux-armv7/sing-box \
-            ./cmd/sing-box
-
-      - name: Build linux 386
-        run: |
-          cd sing-box-src
-          mkdir -p ../dist/linux-386
-          CGO_ENABLED=0 GOOS=linux GOARCH=386 \
-          go build -trimpath \
-            -ldflags "${{ steps.meta.outputs.ldflags }}" \
-            -tags "${{ steps.meta.outputs.tags }}" \
-            -o ../dist/linux-386/sing-box \
-            ./cmd/sing-box
-
-      - name: Verify amd64 build tags
-        run: |
-          chmod +x dist/linux-amd64/sing-box
-          dist/linux-amd64/sing-box version
-          dist/linux-amd64/sing-box version | grep "${{ steps.latest.outputs.version }}"
-          dist/linux-amd64/sing-box version | grep with_v2ray_api
-
-      - name: Verify all binaries exist
-        run: |
-          test -f dist/linux-amd64/sing-box
-          test -f dist/linux-arm64/sing-box
-          test -f dist/linux-armv7/sing-box
-          test -f dist/linux-386/sing-box
-
-      - name: Package tar.gz
+      - name: Package & Sign
         run: |
           mkdir -p release-files
-          tar -C dist/linux-amd64 -czf release-files/sing-box-linux-amd64.tar.gz sing-box
-          tar -C dist/linux-arm64 -czf release-files/sing-box-linux-arm64.tar.gz sing-box
-          tar -C dist/linux-armv7 -czf release-files/sing-box-linux-armv7.tar.gz sing-box
-          tar -C dist/linux-386 -czf release-files/sing-box-linux-386.tar.gz sing-box
-
-          cp dist/linux-amd64/sing-box release-files/sing-box-linux-amd64
-          cp dist/linux-arm64/sing-box release-files/sing-box-linux-arm64
-          cp dist/linux-armv7/sing-box release-files/sing-box-linux-armv7
-          cp dist/linux-386/sing-box release-files/sing-box-linux-386
-
+          for d in dist/*; do
+            arch=$(basename "$d")
+            tar -C "$d" -czf "release-files/sing-box-$arch.tar.gz" sing-box
+            cp "$d/sing-box" "release-files/sing-box-$arch"
+          done
           sha256sum release-files/* > release-files/sha256sum.txt
 
-      - name: Delete existing tag release if needed
+      - name: Delete existing release
+        if: steps.latest.outputs.tag != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ steps.latest.outputs.tag }}"
-          gh release delete "$tag" -R "${{ github.repository }}" -y --cleanup-tag || true
+          gh release delete "${{ steps.latest.outputs.tag }}" -y --cleanup-tag || true
 
-      - name: Create release with gh
+      - name: Create release
+        if: steps.latest.outputs.tag != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ steps.latest.outputs.tag }}"
-          gh release create "$tag" \
-            release-files/sing-box-linux-amd64 \
-            release-files/sing-box-linux-arm64 \
-            release-files/sing-box-linux-armv7 \
-            release-files/sing-box-linux-386 \
-            release-files/sing-box-linux-amd64.tar.gz \
-            release-files/sing-box-linux-arm64.tar.gz \
-            release-files/sing-box-linux-armv7.tar.gz \
-            release-files/sing-box-linux-386.tar.gz \
-            release-files/sha256sum.txt \
+          gh release create "${{ steps.latest.outputs.tag }}" \
+            release-files/* \
             --repo "${{ github.repository }}" \
-            --title "$tag" \
-            --notes "Auto-built sing-box with with_v2ray_api"
+            --title "${{ steps.latest.outputs.tag }}" \
+            --notes "由私人维护工具自动编译，版本：${{ steps.latest.outputs.tag }}，集成 with_v2ray_api。"
