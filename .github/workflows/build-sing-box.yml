@@ -13,33 +13,38 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install dependencies
+      - name: Environment Pre-check
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl tar gzip
+          echo "Checking environment dependencies..."
+          command -v jq >/dev/null 2>&1 || { echo "::error::jq is not installed"; exit 1; }
+          command -v curl >/dev/null 2>&1 || { echo "::error::curl is not installed"; exit 1; }
+          echo "Environment check passed."
 
       - name: Get latest upstream release
         id: latest
         run: |
-          # 加上 Token 授权防止被限流，增加重试机制
-          latest_tag=$(curl -fsSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" --retry 3 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+          # 增加重试机制和更严谨的 Token 调用
+          latest_tag=$(curl -fsSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" --retry 5 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
           if [ -z "$latest_tag" ] || [ "$latest_tag" = "null" ]; then
             echo "::error::无法从官方获取版本号，脚本终止！"
             exit 1
           fi
           echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
           echo "version=${latest_tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Target version detected: $latest_tag"
 
       - name: Get current release in this repo
         id: current
         run: |
-          current_tag=$(curl -fsSL https://api.github.com/repos/${{ github.repository }}/releases/latest 2>/dev/null | jq -r .tag_name || true)
+          current_tag=$(curl -fsSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/latest 2>/dev/null | jq -r .tag_name || echo "")
           echo "tag=$current_tag" >> "$GITHUB_OUTPUT"
+          echo "Local repository latest version: $current_tag"
 
-      - name: Skip if already latest
+      - name: Skip logic
         if: steps.latest.outputs.tag == steps.current.outputs.tag
         run: |
-          echo "当前仓库已是最新版本: ${{ steps.latest.outputs.tag }}"
+          echo "当前仓库已是最新版本: ${{ steps.latest.outputs.tag }}，跳过后续步骤。"
+          # 使用此方法正常终止后续步骤而不在 Workflow 概览显示失败
           exit 0
 
       - name: Checkout sing-box source
@@ -62,21 +67,23 @@ jobs:
         run: |
           cd sing-box-src
           default_tags=$(tr '\n' ',' < release/DEFAULT_BUILD_TAGS | sed 's/,$//')
+          # 过滤重复项并添加 v2ray_api
           final_tags=$(printf '%s\n' "$default_tags" | tr ',' '\n' | grep -v '^with_naive_outbound$' | awk 'NF && !seen[$0]++' | paste -sd',' -)
           final_tags="${final_tags},with_v2ray_api"
           base_ldflags=$(tr '\n' ' ' < release/LDFLAGS | sed 's/  */ /g')
           final_ldflags="-X 'github.com/sagernet/sing-box/constant.Version=${{ steps.latest.outputs.version }}' ${base_ldflags}"
           echo "tags=$final_tags" >> "$GITHUB_OUTPUT"
           echo "ldflags=$final_ldflags" >> "$GITHUB_OUTPUT"
+          echo "Generated tags: $final_tags"
 
       - name: Build All Platforms
         run: |
           cd sing-box-src
-          # 循环编译 amd64, arm64, armv7, 386
           for arch in amd64 arm64 arm 386; do
             output_dir="../dist/linux-$arch"
             [ "$arch" = "arm" ] && output_dir="../dist/linux-armv7"
             mkdir -p "$output_dir"
+            echo "Compiling for linux/$arch..."
             GOARM=7 CGO_ENABLED=0 GOOS=linux GOARCH=$arch \
             go build -trimpath \
               -ldflags "${{ steps.meta.outputs.ldflags }}" \
@@ -90,25 +97,51 @@ jobs:
           mkdir -p release-files
           for d in dist/*; do
             arch=$(basename "$d")
+            echo "Packaging $arch..."
             tar -C "$d" -czf "release-files/sing-box-$arch.tar.gz" sing-box
             cp "$d/sing-box" "release-files/sing-box-$arch"
           done
           sha256sum release-files/* > release-files/sha256sum.txt
+          echo "Check-summing completed."
 
-      - name: Delete existing release
+      - name: Robust Release Cleanup
+        if: always() && steps.latest.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.latest.outputs.tag }}"
+          echo "Starting robust cleanup for tag: $TAG"
+          
+          # 1. 删除 Release 对象
+          gh release delete "$TAG" -y --repo "${{ github.repository }}" || true
+          
+          # 2. 显式删除远程 Git Tag (解决 API 延迟的关键)
+          # 使用项目检出的目录或临时初始化 git 来推送删除指令
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add origin-auth "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" || true
+          git push origin-auth --delete "$TAG" || true
+          
+          # 3. 强制静默期，等待 GitHub API 同步状态
+          echo "Waiting for GitHub API synchronization..."
+          sleep 10
+
+      - name: Create release with retry
         if: steps.latest.outputs.tag != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete "${{ steps.latest.outputs.tag }}" -y --cleanup-tag || true
-
-      - name: Create release
-        if: steps.latest.outputs.tag != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ steps.latest.outputs.tag }}" \
-            release-files/* \
-            --repo "${{ github.repository }}" \
-            --title "${{ steps.latest.outputs.tag }}" \
-            --notes "由私人维护工具自动编译，版本：${{ steps.latest.outputs.tag }}，集成 with_v2ray_api。"
+          TAG="${{ steps.latest.outputs.tag }}"
+          echo "Creating new release: $TAG"
+          
+          # 增加失败重试逻辑
+          for i in {1..3}; do
+            gh release create "$TAG" \
+              release-files/* \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --notes "由私人维护工具自动编译，版本：$TAG，集成 with_v2ray_api。" && break || {
+              echo "Release creation failed, attempt $i of 3. Waiting to retry..."
+              sleep 15
+            }
+          done
